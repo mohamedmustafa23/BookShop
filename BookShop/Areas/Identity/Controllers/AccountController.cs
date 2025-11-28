@@ -1,7 +1,17 @@
-﻿using Microsoft.AspNetCore.Http;
+﻿using Azure.Core;
+using BookShop.DTOs.Requests;
+using BookShop.Services;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.UI.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore.Metadata.Internal;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using System.Threading.Tasks;
 
 namespace BookShop.Areas.Identity.Controllers
 {
@@ -14,12 +24,14 @@ namespace BookShop.Areas.Identity.Controllers
         private readonly IEmailSender _emailSender;
         private readonly SignInManager<ApplicationUser> _signInManager;
         private readonly IRepository<ApplicationUserOTP> _applicationUserOTPRepository;
-        public AccountController(UserManager<ApplicationUser> userManager, IEmailSender emailSender, SignInManager<ApplicationUser> signInManager, IRepository<ApplicationUserOTP> applicationUserOTPRepository)
+        private readonly ITokenService _tokenService;
+        public AccountController(UserManager<ApplicationUser> userManager, IEmailSender emailSender, SignInManager<ApplicationUser> signInManager, IRepository<ApplicationUserOTP> applicationUserOTPRepository, ITokenService tokenService)
         {
             _userManager = userManager;
             _emailSender = emailSender;
             _signInManager = signInManager;
             _applicationUserOTPRepository = applicationUserOTPRepository;
+            _tokenService = tokenService;
         }
         [HttpPost("Register")]
         public async Task<IActionResult> Register(RegisterRequest registerRequest)
@@ -120,9 +132,32 @@ namespace BookShop.Areas.Identity.Controllers
                     });
             }
 
+            // Generate Token
+
+            var userRoles = await _userManager.GetRolesAsync(user);
+
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.Name, user.UserName),
+                new Claim(ClaimTypes.Email, user.Email),
+                new Claim(ClaimTypes.NameIdentifier, user.Id),
+                new Claim(ClaimTypes.Role, String.Join(", ",userRoles)),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString())
+            };
+
+            var accesstoken = _tokenService.GenerateAccessToken(claims);
+            var refreshToken = _tokenService.GenerateRefreshToken();
+
+            user.RefreshToken = refreshToken;
+            user.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7);
+            await _userManager.UpdateAsync(user);
+
             return Ok(new
             {
-                msg = "Login Successful"
+                AccessToken = accesstoken,
+                RefreshToken = refreshToken,
+                validTo = "30 min",
+                RefreshTokenExpiration = "7 days"
             });
         }
         
@@ -244,6 +279,54 @@ namespace BookShop.Areas.Identity.Controllers
             }
 
             return Ok();
+        }
+
+        [HttpPost]
+        [Route("refresh")]
+        public async Task<IActionResult> Refresh(TokenApiRequest tokenApiRequest)
+        {
+            if (tokenApiRequest == null || tokenApiRequest.RefreshToken is null || tokenApiRequest.AccessToken is null)
+                return BadRequest("Invalid client request");
+            
+            string accessToken = tokenApiRequest.AccessToken;
+            string refreshToken = tokenApiRequest.RefreshToken;
+
+            var principal = _tokenService.GetPrincipalFromExpiredToken(accessToken);
+            var userName = principal.Identity.Name;
+
+            var user = _userManager.Users.FirstOrDefault(e => e.UserName == userName);
+            if (user is null || user.RefreshToken != refreshToken || user.RefreshTokenExpiryTime <= DateTime.Now)
+                return BadRequest("Invalid client request");
+
+            var newAccessToken = _tokenService.GenerateAccessToken(principal.Claims);
+            var newRefreshToken = _tokenService.GenerateRefreshToken();
+
+            user.RefreshToken = newRefreshToken;
+            await _userManager.UpdateAsync(user);
+
+            return Ok(new
+            {
+                AccessToken = newAccessToken,
+                validTo = "30 min",
+                RefreshToken = newRefreshToken,
+            });
+        }
+
+        [HttpPost, Authorize]
+        [Route("revoke")]
+        public async Task<IActionResult> Revoke()
+        {
+            var username = User.Identity.Name;
+
+            var user = _userManager.Users.FirstOrDefault(u => u.UserName == username);
+
+            if (user == null) return BadRequest();
+
+            user.RefreshToken = null;
+
+            await _userManager.UpdateAsync(user);
+
+            return NoContent();
         }
     }
 }

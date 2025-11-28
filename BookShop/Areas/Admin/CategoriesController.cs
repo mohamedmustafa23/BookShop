@@ -6,6 +6,7 @@ namespace BookShop.Areas.Admin
     [Area("Admin")]
     [Route("api/[Area]/[controller]")]
     [ApiController]
+    [Authorize]
     public class CategoriesController : ControllerBase
     {
         private readonly IRepository<Category> _categoriesRepository;
